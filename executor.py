@@ -19,8 +19,13 @@ from albef.vit import interpolate_pos_embed
 
 from pytorch_grad_cam.activations_and_gradients import ActivationsAndGradients
 
+
 class Executor:
-    def __init__(self, device: str = "cpu", box_representation_method: str = "crop", method_aggregator: str = "max", enlarge_boxes: int = 0, expand_position_embedding: bool = False, square_size: bool = False, blur_std_dev: int = 100, cache_path: str = None) -> None:
+    # 预处理
+    def __init__(self, device: str = "cpu", box_representation_method: str = "crop", method_aggregator: str = "max",
+                 enlarge_boxes: int = 0, expand_position_embedding: bool = False, square_size: bool = False,
+                 blur_std_dev: int = 100, cache_path: str = None) -> None:
+        # 初始化赋值
         IMPLEMENTED_METHODS = ["crop", "blur", "shade"]
         if any(m not in IMPLEMENTED_METHODS for m in box_representation_method.split(",")):
             raise NotImplementedError
@@ -31,24 +36,35 @@ class Executor:
         self.method_aggregator = method_aggregator
         self.enlarge_boxes = enlarge_boxes
         self.device = device
-        self.expand_position_embedding = expand_position_embedding
+        self.expand_position_embedding = expand_position_embedding  # 默认是 False
         self.square_size = square_size
         self.blur_std_dev = blur_std_dev
         self.cache_path = cache_path
 
+    # 将图片处理成 tensor
     def preprocess_image(self, image: Image) -> List[torch.Tensor]:
         return [preprocess(image) for preprocess in self.preprocesses]
 
+    # 将文本处理成tensor
     def preprocess_text(self, text: str) -> torch.Tensor:
         raise NotImplementedError
 
+    # 父函数
     def call_model(self, model: torch.nn.Module, images: torch.Tensor, text: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
         raise NotImplementedError
 
+    # 对图片做的三种增强处理：crop 裁剪，blur 模糊，shade，遮挡
     def tensorize_inputs(self, caption: str, image: Image, boxes: List[Box], image_name: str = None) -> Tuple[List[torch.Tensor], torch.Tensor]:
+
         images = []
-        for preprocess in self.preprocesses:
+        for preprocess in self.preprocesses:  # self.preprocesses 在子类中重写了，有2次处理 images 大小为 2
             images.append([])
+        """ 图片处理，如果有 cache_path 则不处理，直接加载已处理的 cache"""
+        """ images: [0], [1]
+                     one-image      box[0]  box[1]  box[2]  box[0]  box[1]  box[2]
+            for RN:  images[0]: [ crop[0] crop[1] crop[2] blur[0] blur[1] blur[2] ]
+            for ViT: images[1]: [ crop[0] crop[1] crop[2] blur[0] blur[1] blur[2] ]
+        """
         if self.cache_path is None or any([not os.path.exists(os.path.join(self.cache_path, model_name, image_name, method_name+".pt")) for model_name in self.model_names for method_name in self.box_representation_method.split(',')]):
             if "crop" in self.box_representation_method:
                 for i in range(len(boxes)):
@@ -59,23 +75,30 @@ class Executor:
                         min(boxes[i].right+self.enlarge_boxes, image_i.width),
                         min(boxes[i].bottom+self.enlarge_boxes, image_i.height)
                     ]
+                    """ 调用 PIL 库的图像裁剪函数，先复制完整图片，再对复制的图片进行裁剪"""
                     image_i = image_i.crop(box)
+                    """ 返回一组列表，按照 处理列表的需求进行处理，对于CLIP 来说，有2次，分别处理成丢给 ViT-B/32 和 RN50x16 需要的输入"""
                     preprocessed_images = self.preprocess_image(image_i)
                     for j, img in enumerate(preprocessed_images):
+                        # 注意，这条代码写得很好，是 images[j].append(), 也即是说[0] [1] 分别对应2个模型的输入
                         images[j].append(img.to(self.device))
             if "blur" in self.box_representation_method:
                 for i in range(len(boxes)):
                     image_i = image.copy()
                     mask = Image.new('L', image_i.size, 0)
                     draw = ImageDraw.Draw(mask)
+                    # box 是个元组，不需要扩大，那么 box = (left, top, right, bottom)
                     box = (
                         max(boxes[i].left-self.enlarge_boxes, 0),
                         max(boxes[i].top-self.enlarge_boxes, 0),
                         min(boxes[i].right+self.enlarge_boxes, image_i.width),
                         min(boxes[i].bottom+self.enlarge_boxes, image_i.height)
                     )
+                    """box[:2] 表示遍历切片，即访问(box[0],box[1]), (box[2],box[4]),给出了左上和右下2个点坐标即可绘制一个矩形框"""
                     draw.rectangle([box[:2], box[2:]], fill=255)
                     blurred = image_i.filter(ImageFilter.GaussianBlur(self.blur_std_dev))
+                    # TODO: 没太看懂这个模糊操作
+                    """ 先对整张图片做高斯模糊，之后再将 mask copy 过来，mask 和box 有什么关系？draw这个变量没有用到"""
                     blurred.paste(image_i, mask=mask)
                     preprocessed_images = self.preprocess_image(blurred)
                     for j, img in enumerate(preprocessed_images):
@@ -98,24 +121,54 @@ class Executor:
                     preprocessed_images = self.preprocess_image(shaded_image) # []
                     for j, img in enumerate(preprocessed_images):
                         images[j].append(img.to(self.device))
+            # 没什么操作，把普通列表变换为 torch 堆栈
             imgs = [torch.stack(image_list) for image_list in images]
         else:
             imgs = [[] for _ in self.models]
+        """文本没什么操作，将普通文本加了 a photo of 的 prompt，clip.tokenize(["a photo of "+text.lower()])"""
         text_tensor = self.preprocess_text(caption.lower()).to(self.device)
         return imgs, text_tensor
 
+
+    '''   # CLIP 模型核心计算部分！  '''
+    # 和 with torch.no_grad()， 一样？
     @torch.no_grad()
     def __call__(self, caption: str, image: Image, boxes: List[Box], image_name: str = None) -> torch.Tensor:
+        """ 对图片做的三种增强处理：crop 裁剪，blur 模糊，shade，遮挡，对裁剪之后的图片再进行 CLIP 计算
+            这里面的 images 包含了 crop 和 blur 处理过后的 图片堆叠再一起的结果"""
         images, text_tensor = self.tensorize_inputs(caption, image, boxes, image_name)
+
         all_logits_per_image = []
         all_logits_per_text = []
+
+        # 提取图像处理方式
         box_representation_methods = self.box_representation_method.split(',')
+
+        """# 对 caption 字符串用utf-8的方式进行编码，再对编码采用mashlib模块进行md5加密算法进行hash加密，最后再对加密后字符串获取其16进制的编码"""
+        # https://blog.csdn.net/geerniya/article/details/77531626
         caption_hash = hashlib.md5(caption.encode('utf-8')).hexdigest()
+
+        # self.models = [torch.nn.RN50x16, torch.nn.ViT-B/32]
+        # self.model_names = [RN50x16, ViT-B-32]
+        #        images = [RN[[][][]], ViT[[][][]]]
+        """ images: [[0], [1]]
+                     one-image      box[0]  box[1]  box[2]  box[0]  box[1]  box[2]
+            for RN:  images[0]: [ crop[0] crop[1] crop[2] blur[0] blur[1] blur[2] ]
+            for ViT: images[1]: [ crop[0] crop[1] crop[2] blur[0] blur[1] blur[2] ]
+        """
+        # TODO: images 是一系列box图片，这会产生哪些组合？
+        """经过 ZIP提取，会抽出2组数据，一组是 RN50x16 的模型、图片、模型名，一组是ViT-B/32的模型、图片、模型名"""
         for model, images_t, model_name in zip(self.models, images, self.model_names):
+            # TODO: self.cache_path 在什么时候被赋值的？？答：压根没有赋值
+            # 提取缓冲的文本编码数据
             if self.cache_path is not None:
                 text_cache_path = os.path.join(self.cache_path, model_name, "text"+("_shade" if self.box_representation_method == "shade" else ""))
+
             image_features = None
             text_features = None
+
+            """ 提取缓冲的图像编码数据，os.path.exists(path)	如果路径 path 存在，返回 True；如果路径 path 不存在，返回 False。"""
+            # 默认没有，不用管"""
             if self.cache_path is not None and os.path.exists(os.path.join(self.cache_path, model_name)):
                 if os.path.exists(os.path.join(text_cache_path, caption_hash+".pt")):
                     text_features = torch.load(os.path.join(text_cache_path, caption_hash+".pt"), map_location=self.device)
@@ -130,9 +183,16 @@ class Executor:
                             ]))
                         image_features = torch.stack(image_features)
                         image_features = image_features.view(-1, image_features.shape[-1])
+
+            '''# CLIP 相似度计算!!'''
+            # 这一部分的相似度计算，还需要和 ALBEF 兼容，所以单独写成函数再进行调用
             logits_per_image, logits_per_text, image_features, text_features = self.call_model(model, images_t, text_tensor, image_features=image_features, text_features=text_features)
+
+            # 图片的 logits 压根没用上，仅用了 文本的 logits
             all_logits_per_image.append(logits_per_image)
             all_logits_per_text.append(logits_per_text)
+
+            # TODO: 不用管，没用上
             if self.cache_path is not None and image_name is not None and image_features is not None:
                 image_features = image_features.view(len(box_representation_methods), len(boxes), image_features.shape[-1])
                 if not os.path.exists(os.path.join(self.cache_path, model_name, image_name)):
@@ -154,47 +214,80 @@ class Executor:
             all_logits_per_text = all_logits_per_text.view(-1, len(boxes)).max(dim=0, keepdim=True)[0]
         elif self.method_aggregator == "sum":
             all_logits_per_text = all_logits_per_text.view(-1, len(boxes)).sum(dim=0, keepdim=True)
+            # print("This is the original CLIP result:")
+            # print(all_logits_per_text)
+            # print(all_logits_per_text.view(-1))
+        """ 举个例子，refcocog_test 第一张图片，6 个 box，2句sentences，对于每一个sentence 上述输出为:
+            tensor([[ 76.0000, 100.5000,  83.8750,  91.8750, 109.6250,  78.7500]], device='cuda:0', dtype=torch.float16)
+            tensor([ 76.0000, 100.5000,  83.8750,  91.8750, 109.6250,  78.7500], device='cuda:0', dtype=torch.float16)
+        """
         return all_logits_per_text.view(-1)
 
+
+'''仅仅重载了文本 token 预处理方式，相似度计算，其他都基本没变'''
 class ClipExecutor(Executor):
-    def __init__(self, clip_model: str = "ViT-B/32", device: str = "cpu", box_representation_method: str = "crop", method_aggregator: str = "max", enlarge_boxes: int = 0, expand_position_embedding: bool = False, square_size: bool = False, blur_std_dev: int = 100, cache_path: str = None) -> None:
-        super().__init__(device, box_representation_method, method_aggregator, enlarge_boxes, expand_position_embedding, square_size, blur_std_dev, cache_path)
+    # 初始化
+    def __init__(self, clip_model: str = "ViT-B/32", device: str = "cpu", box_representation_method: str = "crop",
+                 method_aggregator: str = "max", enlarge_boxes: int = 0, expand_position_embedding: bool = False,
+                 square_size: bool = False, blur_std_dev: int = 100, cache_path: str = None) -> None:
+        # 赋值
+        super().__init__(device, box_representation_method, method_aggregator, enlarge_boxes, expand_position_embedding,
+                         square_size, blur_std_dev, cache_path)
+        # 模型堆叠
         self.clip_models = clip_model.split(",")
+        # 用_ 替代/，model_names=[RN50x16, ViT-B-32]
         self.model_names = [model_name.replace("/", "_") for model_name in self.clip_models]
         self.models = []
         self.preprocesses = []
+        # 把 2 个模型堆起来
         for model_name in self.clip_models:
+            """ CLIP 模型加载！ """
             model, preprocess = clip.load(model_name, device=device, jit=False)
             self.models.append(model)
             if self.square_size:
+                # 因为使用/加载了2个CLIP模型，所以会打印2次
                 print("Square size!")
+                """ 使用双三次插值，将图片Resize成 input_resolution * input_resolution 大小，应该是CLIP 内置的 224*224 """
                 preprocess.transforms[0] = transforms.Resize((model.visual.input_resolution, model.visual.input_resolution), interpolation=transforms.InterpolationMode.BICUBIC)
+            # 将预处理叠起来
             self.preprocesses.append(preprocess)
+        # 将 2 个模型叠起来
         self.models = torch.nn.ModuleList(self.models)
 
+    # 这里的 文本 token 化和 CLIP里面一模一样
     def preprocess_text(self, text: str) -> torch.Tensor:
         if "shade" in self.box_representation_method:
             return clip.tokenize([text.lower()+" is in red color."])
         return clip.tokenize(["a photo of "+text.lower()])
 
+    # CLIP 相似度计算
     def call_model(self, model: torch.nn.Module, images: torch.Tensor, text: torch.Tensor, image_features: torch.Tensor = None, text_features: torch.Tensor = None) -> torch.Tensor:
+        # 如果没有图、文特征的情况下
         if image_features is None:
-            print('computing image features')
+            '''计算图片特征！'''
+            # print('computing image features')
             image_features = model.encode_image(images)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         if text_features is None:
-            print('computing text features')
+            '''计算文本特征！'''
+            # print('computing text features')
             text_features = model.encode_text(text)
-            # normalized features
+            # normalized features，layer norm？？？
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
         # cosine similarity as logits
+        # CLIP 相似度计算！
+        # TODO：这里的 logit_scale 是个啥？？
         logit_scale = model.logit_scale.exp()
+        # TODO：怎么理解这里？？ 文本需要转置相乘
         logits_per_image = logit_scale * image_features @ text_features.t()
+        """ 文本logits 和 图像logits 是转置关系"""
         logits_per_text = logits_per_image.t()
         return logits_per_image, logits_per_text, image_features, text_features
 
     def __call__(self, caption: str, image: Image, boxes: List[Box], image_name: str = None) -> torch.Tensor:
+        # 额外增加 position embedding，默认不执行
+        # TODO: 如果要做额外 position embedding 是做什么？
         if self.expand_position_embedding:
             original_preprocesses = self.preprocesses
             new_preprocesses = []
@@ -243,7 +336,11 @@ class ClipExecutor(Executor):
                 new_preprocesses.append(transform)
                 original_position_embeddings.append(original_positional_embedding)
             self.preprocesses = new_preprocesses
+
+        # TODO: 调用默认的继承的 call 函数，执行CLIP核心计算！super()函数这种写法写在代码中间好牛皮
         result = super().__call__(caption, image, boxes, image_name)
+
+        # 默认不执行
         if self.expand_position_embedding:
             self.preprocesses = original_preprocesses
             for model, model_name, pos_embedding in zip(self.models, self.clip_models, original_position_embeddings):
@@ -251,7 +348,9 @@ class ClipExecutor(Executor):
                     model.visual.attnpool.positional_embedding = torch.nn.Parameter(pos_embedding)
                 else:
                     model.visual.positional_embedding = torch.nn.Parameter(pos_embedding)
+
         return result
+
 
 class ClipGradcamExecutor(ClipExecutor):
     def __init__(self, clip_model: str = "ViT-B/32", device: str = "cpu", box_representation_method: str = "crop", method_aggregator: str = "max", gradcam_alpha: List[float] = [1.0], expand_position_embedding: bool = False, background_subtract: bool = False, square_size: bool = False, blur_std_dev: int = 100, gradcam_ensemble_before: bool = False) -> None:
@@ -384,8 +483,12 @@ class ClipGradcamExecutor(ClipExecutor):
         return scores
 
 class AlbefExecutor(Executor):
-    def __init__(self, checkpoint_path: str, config_path: str, max_words: int = 30, device: str = "cpu", box_representation_method: str = "crop", method_aggregator: str = "max", mode: str = "itm", enlarge_boxes: int = 0, expand_position_embedding: bool = False, square_size: bool = False, blur_std_dev: int = 100, cache_path: str = None) -> None:
-        super().__init__(device, box_representation_method, method_aggregator, enlarge_boxes, expand_position_embedding, square_size, blur_std_dev, cache_path)
+    def __init__(self, checkpoint_path: str, config_path: str, max_words: int = 30, device: str = "cpu",
+                 box_representation_method: str = "crop", method_aggregator: str = "max", mode: str = "itm",
+                 enlarge_boxes: int = 0, expand_position_embedding: bool = False, square_size: bool = False,
+                 blur_std_dev: int = 100, cache_path: str = None) -> None:
+        super().__init__(device, box_representation_method, method_aggregator, enlarge_boxes, expand_position_embedding,
+                         square_size, blur_std_dev, cache_path)
         if device == "cpu":
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
         else:

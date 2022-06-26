@@ -11,3 +11,4 @@ class RefMethod(metaclass=ABCMeta):
 
     def get_stats(self) -> Dict[str, Any]:
         return {}
+

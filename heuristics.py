@@ -12,7 +12,8 @@ class RelHeuristic(NamedTuple):
 
 class Heuristics:
     """A class defining heuristics that can be enabled/disabled."""
-
+    """定义启发式的类，可以启用/禁用。"""
+    # lambda [arg1 [,arg2,.....argn]]:expression  下面将位置关系和语义结合起来
     RELATIONS = [
         RelHeuristic(["left", "west"], lambda env: env.left_of()),
         RelHeuristic(["right", "east"], lambda env: env.right_of()),
@@ -42,10 +43,10 @@ class Heuristics:
     EMPTY = []
 
     def __init__(self, args: Namespace = None):
-        self.enable_relations = not args or not args.no_rel
-        self.enable_superlatives = not args or not args.no_sup
-        self.enable_nulls = not args or not args.no_null
-        self.enable_ternary = not args or args.ternary
+        self.enable_relations = not args or not args.no_rel     # args.no_rel 表示关闭关系提取，默认 enable_relations=True
+        self.enable_superlatives = not args or not args.no_sup  # args.no_sup 表示关闭最高级，默认enable_superlatives=True
+        self.enable_nulls = not args or not args.no_null        # args.no_null 表示关闭空词启发，默认 enable_nulls=True
+        self.enable_ternary = not args or args.ternary          # args.ternary 表示禁用三元关系，默认 enable_ternary=False
 
     @property
     def relations(self) -> List[RelHeuristic]:
@@ -66,3 +67,4 @@ class Heuristics:
     @property
     def null_keywords(self) -> List[str]:
         return self.NULL_KEYWORDS if self.enable_nulls else self.EMPTY
+

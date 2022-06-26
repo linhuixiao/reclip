@@ -21,6 +21,20 @@ def intersect(A, B, C, D):
     return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
 
 
+''' illustration of box:
+      (x,y)        w
+        · --------------------
+        |                     |
+        |                     |
+      h |                     |
+        |                     |
+        |                     |
+        |                     |
+         ---------------------
+
+'''
+
+
 class Box(NamedTuple):
     x: int
     y: int
@@ -48,10 +62,10 @@ class Box(NamedTuple):
         return Box(self.x + self.w // 2, self.y + self.h // 2)
 
     def corners(self):
-        yield Box(self.x, self.y)
-        yield Box(self.x + self.w, self.y)
-        yield Box(self.x + self.w, self.y + self.h)
-        yield Box(self.x, self.y + self.h)
+        yield Box(self.x, self.y)                     # 左上
+        yield Box(self.x + self.w, self.y)            # 右上
+        yield Box(self.x + self.w, self.y + self.h)   # 右下
+        yield Box(self.x, self.y + self.h)            # 左下
 
     @property
     def area(self):
@@ -104,7 +118,9 @@ def all_equal(iterable):
 
 class spatial:
     """A decorator that converts a predicate over boxes to a function that returns a tensor over all boxes."""
+    """"一个装饰器，它将 box 上的谓词转换为一个函数，这个函数在所有 box 上返回一个张量。"""
 
+    # arity 参数数量，enforce_antisymmetry：强制反对称
     def __init__(self, arity: int = 2, enforce_antisymmetry: bool = False):
         self.arity = arity
         self.enforce_antisymmetry = enforce_antisymmetry  # Zero out any entries where two boxes are the same.
@@ -141,18 +157,26 @@ class Environment:
                temperature: float = 1.,
                area_threshold: float = 0.0,
                softmax: bool = False,
-               expand: float = None
-              ) -> np.ndarray:
+               expand: float = None) -> np.ndarray:
         """Return a new distribution reflecting the likelihood that `caption` describes the content of each box."""
+        """返回一个新的分布，反映 ' caption ' 描述每个盒子内容的可能性。"""
+        # 过滤小box，阈值为0，相当于没有操作
+        # 执行CLIP前 相当于啥也没干
         area_filtered_dist = torch.from_numpy(self.filter_area(area_threshold)).to(self.executor.device)
         candidate_indices = [i for i in range(len(self.boxes)) if float(area_filtered_dist[i]) > 0.0]
+        # 将 box 拿出来存在列表里
         boxes = [self.boxes[i] for i in candidate_indices]
         if len(boxes) == 0:
             boxes = self.boxes
             candidate_indices = list(range(len(boxes)))
+        # 默认为0，不执行
         if expand is not None:
             boxes = [box.expand(expand) for box in boxes]
+
+        '''# 调用 executor，计算 CLIP！！！'''
         result_partial = self.executor(caption, self.image, boxes, image_name=self.image_name)
+
+        # TODO: 如果有其他形式的 box 的处理方式，没太理解为什么放在后面
         if self.freeform_boxes:
             result_partial, boxes = result_partial
             self.boxes = [Box(x=boxes[i,0].item(), y=boxes[i,1].item(), w=boxes[i,2].item()-boxes[i,0].item(), h=boxes[i,3].item()-boxes[i,1].item()) for i in range(boxes.shape[0])]
@@ -164,12 +188,15 @@ class Environment:
             result = torch.zeros((len(self.boxes))).to(result_partial.device)
             result[candidate_indices] = result_partial
         else:
+            # 把数据考出
             result = torch.zeros((len(self.boxes))).to(result_partial.device)
             result[candidate_indices] = result_partial.softmax(dim=-1)
+        # 最后返回的也是一个数组
         return result.cpu().numpy()
 
     def filter_area(self, area_threshold: float) -> np.ndarray:
         """Return a new distribution in which all boxes whose area as a fraction of the image is less than the threshold."""
+        """返回一个新的分布，其中所有框的面积作为图像的一部分小于阈值。其实就是过滤小box，阈值设为0，就是啥也没干"""
         image_area = self.image.width*self.image.height
         return np.array([1 if self.boxes[i].area/image_area > area_threshold else 0 for i in range(len(self.boxes))])
 
